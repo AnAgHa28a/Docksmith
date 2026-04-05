@@ -1,0 +1,7 @@
+FROM base
+WORKDIR /app
+ENV NAME=Anagha
+COPY sample_app /app
+COPY hello.txt /app
+RUN echo "build step worked" > /app/build_log.txt
+CMD echo secret > inside.txt && ls && pwd
