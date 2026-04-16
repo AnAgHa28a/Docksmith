@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from storage import init_storage, get_base_images_path, get_image_paths
 from manifest import write_manifest, load_manifest
@@ -68,6 +69,73 @@ def hash_copy_source(src_path):
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
+def execute_copy_step(context, temp_fs, args, line, config, prev_layer_digest, no_cache):
+    time.sleep(2)
+    parts = args.split()
+    if len(parts) != 2:
+        return {"error": "Invalid COPY instruction"}
+
+    src, dest = parts
+    src_path = os.path.abspath(os.path.join(context, src))
+
+    if not os.path.exists(src_path):
+        return {"error": f"COPY source not found: {src}"}
+
+    extra = hash_copy_source(src_path)
+    workdir = config["WorkingDir"] or ""
+    env_list = config["Env"]
+
+    cache_key = compute_cache_key(
+        prev_layer_digest,
+        line,
+        workdir,
+        env_list,
+        extra
+    )
+
+    start = time.time()
+    cached = None if no_cache else cache_lookup(cache_key)
+
+    if cached:
+        duration = time.time() - start
+        return {
+            "cached": True,
+            "duration": duration,
+            "layer_info": cached,
+            "line": line,
+            "args": args
+        }
+
+    before = snapshot_files(temp_fs)
+
+    dest_path = os.path.join(temp_fs, dest.lstrip("/"))
+    os.makedirs(dest_path, exist_ok=True)
+
+    if os.path.isdir(src_path):
+        shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src_path, dest_path)
+
+    after = snapshot_files(temp_fs)
+    changed_files = find_changed_files(before, after)
+
+    layer_info = create_layer_tar(temp_fs, changed_files)
+    layer_info["createdBy"] = f"COPY {args}"
+
+    if not no_cache:
+        cache_store(cache_key, layer_info)
+
+    duration = time.time() - start
+
+    return {
+        "cached": False,
+        "duration": duration,
+        "layer_info": layer_info,
+        "line": line,
+        "args": args
+    }
+
+
 def build_image(tag, context, no_cache=False):
     init_storage()
 
@@ -95,8 +163,10 @@ def build_image(tag, context, no_cache=False):
         print("\nProcessing Instructions:\n")
 
         prev_layer_digest = ""
+        i = 0
 
-        for line in instructions:
+        while i < len(instructions):
+            line = instructions[i]
             cmd, args = parse_instruction(line)
 
             if cmd == "FROM":
@@ -105,80 +175,72 @@ def build_image(tag, context, no_cache=False):
                     return
                 config["BaseImage"] = args
                 prev_layer_digest = "base:" + args
+                i += 1
 
             elif cmd == "WORKDIR":
                 config["WorkingDir"] = args
                 print("Set WORKDIR:", args)
+                i += 1
 
             elif cmd == "ENV":
                 config["Env"].append(args)
                 print("Added ENV:", args)
+                i += 1
 
             elif cmd == "CMD":
                 config["Cmd"] = args
                 print("Set CMD:", args)
+                i += 1
 
             elif cmd == "COPY":
-                parts = args.split()
-                if len(parts) != 2:
-                    print("Invalid COPY instruction")
-                    return
+                copy_block = []
 
-                src, dest = parts
-                src_path = os.path.abspath(os.path.join(context, src))
+                while i < len(instructions):
+                    next_line = instructions[i]
+                    next_cmd, next_args = parse_instruction(next_line)
 
-                if not os.path.exists(src_path):
-                    print("COPY source not found:", src)
-                    return
+                    if next_cmd != "COPY":
+                        break
 
-                extra = hash_copy_source(src_path)
-                workdir = config["WorkingDir"] or ""
-                env_list = config["Env"]
+                    copy_block.append((next_line, next_args))
+                    i += 1
 
-                cache_key = compute_cache_key(
-                    prev_layer_digest,
-                    line,
-                    workdir,
-                    env_list,
-                    extra
-                )
+                if len(copy_block) > 1:
+                    print(f"[PARALLEL COPY] Executing {len(copy_block)} COPY instructions together")
 
-                start = time.time()
-                cached = None if no_cache else cache_lookup(cache_key)
+                with ThreadPoolExecutor(max_workers=len(copy_block)) as executor:
+                    futures = []
+                    local_prev_digest = prev_layer_digest
 
-                if cached:
-                    duration = time.time() - start
-                    print(f"[CACHE HIT] COPY {args} {duration:.2f}s")
-                    manifest_layers.append(cached)
-                    prev_layer_digest = cached["digest"]
-                    continue
+                    for copy_line, copy_args in copy_block:
+                        futures.append(
+                            executor.submit(
+                                execute_copy_step,
+                                context,
+                                temp_fs,
+                                copy_args,
+                                copy_line,
+                                config,
+                                local_prev_digest,
+                                no_cache
+                            )
+                        )
 
-                print(f"[CACHE MISS] COPY {args}", end=" ")
+                    results = [future.result() for future in futures]
 
-                all_layer_steps_hit = False
-                before = snapshot_files(temp_fs)
+                for result in results:
+                    if "error" in result:
+                        print(result["error"])
+                        return
 
-                dest_path = os.path.join(temp_fs, dest.lstrip("/"))
-                os.makedirs(dest_path, exist_ok=True)
+                    if result["cached"]:
+                        print(f"[CACHE HIT] COPY {result['args']} {result['duration']:.2f}s")
+                    else:
+                        print(f"[CACHE MISS] COPY {result['args']} {result['duration']:.2f}s")
+                        all_layer_steps_hit = False
 
-                if os.path.isdir(src_path):
-                    shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(src_path, dest_path)
-
-                after = snapshot_files(temp_fs)
-                changed_files = find_changed_files(before, after)
-
-                layer_info = create_layer_tar(temp_fs, changed_files)
-                layer_info["createdBy"] = f"COPY {args}"
-                manifest_layers.append(layer_info)
-
-                if not no_cache:
-                    cache_store(cache_key, layer_info)
-
-                prev_layer_digest = layer_info["digest"]
-                duration = time.time() - start
-                print(f"{duration:.2f}s")
+                    manifest_layers.append(result["layer_info"])
+                    prev_layer_digest = result["layer_info"]["digest"]
 
             elif cmd == "RUN":
                 workdir = config["WorkingDir"] or ""
@@ -199,6 +261,7 @@ def build_image(tag, context, no_cache=False):
                     print(f"[CACHE HIT] RUN {args} {duration:.2f}s")
                     manifest_layers.append(cached)
                     prev_layer_digest = cached["digest"]
+                    i += 1
                     continue
 
                 print(f"[CACHE MISS] RUN {args}", end=" ")
@@ -233,6 +296,7 @@ def build_image(tag, context, no_cache=False):
                 prev_layer_digest = layer_info["digest"]
                 duration = time.time() - start
                 print(f"{duration:.2f}s")
+                i += 1
 
             else:
                 print("Unknown instruction:", cmd)
@@ -261,3 +325,4 @@ def build_image(tag, context, no_cache=False):
     finally:
         shutil.rmtree(temp_fs)
         print("Cleaned up temp filesystem")
+

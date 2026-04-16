@@ -1,3 +1,4 @@
+import tempfile
 import os
 import tarfile
 import hashlib
@@ -52,7 +53,8 @@ def _deterministic_tarinfo(tarinfo):
 
 def create_layer_tar(root, changed_files):
     layers_dir = get_layers_path()
-    temp_tar_path = os.path.join(layers_dir, "temp_layer.tar")
+    fd, temp_tar_path = tempfile.mkstemp(suffix=".tar", dir=layers_dir)
+    os.close(fd)
 
     with tarfile.open(temp_tar_path, "w") as tar:
         for rel_path in sorted(changed_files):
@@ -75,7 +77,6 @@ def create_layer_tar(root, changed_files):
         "digest": "sha256:" + digest,
         "size": size
     }
-
 
 def extract_layer_tar(layer_digest, dest_root):
     digest_value = layer_digest.replace("sha256:", "")
